@@ -1,0 +1,1298 @@
+#!/usr/bin/env python3
+import torch
+import torch.multiprocessing as mp
+import torch.nn as nn
+import torch.optim as optim
+import os
+import sys
+import glob
+import numpy as np
+import json
+import yaml
+import traceback
+from datetime import datetime
+from functools import partial
+import torch.cuda.amp as amp
+from typing import List, Dict, Tuple, Any, Optional
+import time
+import gzip
+import io
+import math
+import re
+
+# Import your model and helper functions
+from helpers.FFNN import DeepNN
+from helpers.utils import save_dataset, save_results, save_model
+
+# Ensure prints flush immediately
+print = partial(print, flush=True)
+
+# PERFORMANCE CONFIGURATION
+# These settings are configurable for different experiment sizes
+TINY_THRESHOLD = 1000     # n_train < TINY_THRESHOLD for tiny experiments
+SMALL_THRESHOLD = 10000   # TINY_THRESHOLD <= n_train < SMALL_THRESHOLD for small experiments
+MEDIUM_THRESHOLD = 100000 # SMALL_THRESHOLD <= n_train < MEDIUM_THRESHOLD for medium experiments
+LARGE_THRESHOLD = 2000000 # MEDIUM_THRESHOLD <= n_train < LARGE_THRESHOLD for large experiments
+# n_train >= LARGE_THRESHOLD for huge experiments
+
+MAX_PARALLEL_TINY = 16    # For tiny experiments
+MAX_PARALLEL_SMALL = 8    # For small experiments
+MAX_PARALLEL_MEDIUM = 4   # For medium experiments
+MAX_PARALLEL_LARGE = 2    # For large experiments
+MAX_PARALLEL_HUGE = 1     # For huge experiments
+
+BATCH_SIZE_TINY = 1024    # Batch size for tiny experiments
+BATCH_SIZE_SMALL = 4096   # Batch size for small experiments
+BATCH_SIZE_MEDIUM = 8192  # Batch size for medium experiments
+BATCH_SIZE_LARGE = 32768  # Batch size for large experiments
+BATCH_SIZE_HUGE = 32768   # Batch size for huge experiments (>1M samples)
+
+ORIG_BATCH_SIZE = 32768   # Original batch size reference for LR scaling
+
+BATCH_POWER = 0.5         # Power for batch size scaling
+
+# New constant for evaluation subset size
+EVAL_SUBSET_SIZE = 20000  # Maximum number of points to use for evaluation
+
+# Gradient noise scale measurement constants
+MEASURE_BATCHES = 50      # Number of batches to measure gradient statistics
+MEASURE_BATCH_SIZE = 512  # Batch size for gradient statistics
+
+# Normalization and standardization functions
+def normalize_data(data, dim=1, range_min=-1, range_max=1):
+    """Normalize data to range [range_min, range_max]"""
+    mins, _ = torch.min(data, dim=dim, keepdim=True)
+    maxs, _ = torch.max(data, dim=dim, keepdim=True)
+    data_range = maxs - mins
+    data_range[data_range == 0] = 1.0
+    
+    normalized_0_1 = (data - mins) / data_range
+    normalized = normalized_0_1 * (range_max - range_min) + range_min
+    
+    return normalized, {'mins': mins, 'range': data_range, 'range_min': range_min, 'range_max': range_max}
+
+def standardize_data(data, dim=1):
+    """Standardize data to mean=0, std=1"""
+    means = torch.mean(data, dim=dim, keepdim=True)
+    stds = torch.std(data, dim=dim, keepdim=True)
+    stds[stds == 0] = 1.0
+    
+    standardized = (data - means) / stds
+    
+    return standardized, {'means': means, 'stds': stds}
+
+def measure_gradient_statistics(model, X_train, y_train, device, n_samples=MEASURE_BATCHES, 
+                               batch_size=MEASURE_BATCH_SIZE):
+    """Measure gradient variance and mean across mini-batches"""
+    all_grads = []
+    model.eval()
+    
+    # Generate indices for n_samples mini-batches
+    indices_list = []
+    for i in range(n_samples):
+        if len(X_train) <= batch_size:
+            indices = torch.arange(len(X_train), device=device)
+        else:
+            indices = torch.randperm(len(X_train), device=device)[:batch_size]
+        indices_list.append(indices)
+    
+    # Sample n_samples mini-batches
+    for indices in indices_list:
+        inputs = X_train[indices]
+        targets = y_train[indices]
+        
+        # Forward and backward pass
+        model.zero_grad(set_to_none=True)
+        outputs = model(inputs)
+        loss = torch.mean((outputs - targets) ** 2)
+        loss.backward()
+        
+        # Extract and flatten gradients
+        grads = []
+        for param in model.parameters():
+            if param.grad is not None:
+                grads.append(param.grad.data.view(-1).cpu())
+        
+        if grads:
+            all_grads.append(torch.cat(grads))
+    
+    if not all_grads:
+        return None, None
+        
+    # Stack gradients from different batches
+    batch_grads = torch.stack(all_grads)
+    
+    # Calculate statistics
+    grad_mean = torch.mean(batch_grads, dim=0)
+    grad_var = torch.var(batch_grads, dim=0)
+    
+    return grad_mean, grad_var
+
+def compute_noise_scale(grad_mean, grad_var):
+    """Compute gradient noise scale (B*) - the theoretically optimal batch size"""
+    if grad_mean is None or grad_var is None:
+        return BATCH_SIZE_TINY
+        
+    trace_V = torch.sum(grad_var)
+    squared_mean = torch.sum(grad_mean**2)
+    
+    # Handle numerical stability
+    if squared_mean < 1e-10:
+        return BATCH_SIZE_HUGE
+        
+    B_star = trace_V / squared_mean
+    try:
+        return max(BATCH_SIZE_TINY, min(BATCH_SIZE_HUGE, int(B_star.item())))
+    except (OverflowError, ValueError):
+        print(f"Warning: GNS calculation resulted in overflow/infinity, using maximum batch size")
+        return BATCH_SIZE_HUGE
+
+def load_yaml_config(config_path):
+    """Load and return the configuration from a YAML file."""
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+def extract_info_from_nn_path(path):
+    """Extract parameters from NN dataset path"""
+    basename = os.path.basename(path)
+    info = {"distribution_type": "gaussian"}  # Mark as gaussian type
+    
+    # Extract dimension
+    d_match = re.search(r'd(\d+)', basename)
+    if d_match:
+        info['input_dim'] = int(d_match.group(1))
+    
+    # Extract architecture
+    arch_match = re.search(r'arch([0-9x]+)', basename)
+    if arch_match:
+        arch_str = arch_match.group(1)
+        info['architecture'] = [int(dim) for dim in arch_str.split('x')]
+    
+    # Extract variance
+    var_match = re.search(r'var([0-9p]+)', basename)
+    if var_match:
+        var_str = var_match.group(1).replace('p', '.')
+        info['init_variance'] = float(var_str)
+    
+    # Extract experiment number
+    exp_match = re.search(r'_(\d+)(?:_\d{8}|\.|$)', basename)
+    if exp_match:
+        info['experiment_num'] = int(exp_match.group(1))
+        
+    return info
+
+def generate_unique_id(config):
+    """Generate a unique identifier for this configuration."""
+    ds_name = config['ds_name']
+    
+    # Format architecture as string
+    arch = config.get('architecture', [])
+    arch_str = 'x'.join([str(dim) for dim in arch])
+    
+    # Format initialization variance 
+    init_var = config.get('init_variance', 0.1)
+    var_str = f"var{init_var}".replace('.', 'p')
+    
+    # Get frozen status
+    frozen_suffix = "_frozen" if config.get('frozen', False) else ""
+    align_suffix = "_align" if config['alignment'] else ""
+    norm_suffix = "_norm" if config.get('normalize_data', False) else ""
+    std_suffix = "_std" if config.get('standardize_data', False) else ""
+    
+    unique_id = (
+        f"{ds_name}"
+        f"_d{config['input_dim']}"
+        f"_arch{arch_str}"
+        f"_{var_str}"
+        f"_h{config['hidden_size']}"
+        f"_d{config['depth']}"
+        f"_n{config['n_train']}"
+        f"_lr{config['lr']}"
+        f"_mode{config['mode']}"
+        f"_exp{config['experiment_num']}"
+        f"{frozen_suffix}"
+        f"{align_suffix}"
+        f"{norm_suffix}"
+        f"{std_suffix}"
+    )
+    
+    return unique_id
+
+def find_nn_dataset_files(directory):
+    """Find NN dataset X and y files in the given directory"""
+    try:
+        # Find all .pt.gz files in the directory
+        all_files = [os.path.join(directory, f) for f in os.listdir(directory) 
+                    if os.path.isfile(os.path.join(directory, f)) and 
+                    f.endswith('.pt.gz')]
+        
+        print(f"Found {len(all_files)} potential dataset files in {directory}")
+        
+        # Find NN dataset files (using pattern for gaussian NN datasets)
+        x_files = [f for f in all_files if 'dataset_X_NN_gaussian' in os.path.basename(f)]
+        y_files = [f for f in all_files if 'dataset_y_NN_gaussian' in os.path.basename(f)]
+        
+        if not x_files or not y_files:
+            print(f"No NN dataset files found in {directory}")
+            return None
+        
+        # Match X and y files based on the common filename part
+        for x_file in x_files:
+            x_name = os.path.basename(x_file).replace('dataset_X_', '')
+            for y_file in y_files:
+                y_name = os.path.basename(y_file).replace('dataset_y_', '')
+                if x_name == y_name:
+                    print(f"Found matching NN dataset X and y files")
+                    return {'x': x_file, 'y': y_file}
+        
+        # If no matched pairs, use the first of each
+        print(f"No exact X/y matches found, using first available files")
+        return {'x': x_files[0], 'y': y_files[0]}
+        
+    except Exception as e:
+        print(f"Error finding NN dataset files: {str(e)}")
+        return None
+
+def load_dataset_info(directory):
+    """Load NN dataset info"""
+    if not os.path.isdir(directory):
+        return None
+    
+    # Find dataset files
+    dataset_files = find_nn_dataset_files(directory)
+    if not dataset_files:
+        return None
+    
+    # Extract parameters
+    params = extract_info_from_nn_path(directory)
+    
+    # Extract dataset name from directory
+    ds_name = os.path.basename(directory)
+    
+    # Calculate size of dataset
+    x_size_mb = os.path.getsize(dataset_files['x']) / (1024 * 1024)
+    y_size_mb = os.path.getsize(dataset_files['y']) / (1024 * 1024)
+    file_size_mb = x_size_mb + y_size_mb
+    
+    return {
+        "files": dataset_files,
+        "name": ds_name,
+        "params": params,
+        "directory": directory,
+        "size_mb": file_size_mb
+    }
+
+def load_dataset_directly(dataset_files, device):
+    """Load NN dataset directly to GPU"""
+    data = {'X': None, 'y': None}
+    
+    try:
+        # Load X file
+        x_path = dataset_files['x']
+        print(f"Loading X data from: {x_path}")
+        
+        if not os.path.exists(x_path):
+            raise FileNotFoundError(f"X file not found: {x_path}")
+            
+        with gzip.open(x_path, 'rb') as f:
+            x_data = torch.load(f, map_location='cpu', weights_only=True)
+        
+        # Check if it's a dictionary with 'X' key or a direct tensor
+        if isinstance(x_data, dict) and 'X' in x_data and x_data['X'] is not None:
+            data['X'] = x_data['X'].to(device, non_blocking=True)
+        elif isinstance(x_data, torch.Tensor):
+            data['X'] = x_data.to(device, non_blocking=True)
+        else:
+            raise ValueError("Could not extract X data from file")
+        
+        # Load y file
+        y_path = dataset_files['y']
+        print(f"Loading y data from: {y_path}")
+        
+        if not os.path.exists(y_path):
+            raise FileNotFoundError(f"y file not found: {y_path}")
+            
+        with gzip.open(y_path, 'rb') as f:
+            y_data = torch.load(f, map_location='cpu', weights_only=True)
+        
+        # Check if it's a dictionary with 'y' key or a direct tensor
+        if isinstance(y_data, dict) and 'y' in y_data and y_data['y'] is not None:
+            data['y'] = y_data['y'].to(device, non_blocking=True)
+        elif isinstance(y_data, torch.Tensor):
+            data['y'] = y_data.to(device, non_blocking=True)
+        else:
+            raise ValueError("Could not extract y data from file")
+    
+    except Exception as e:
+        print(f"Error loading dataset: {str(e)}")
+        traceback.print_exc()
+        raise
+    
+    # Final checks
+    if data['X'] is None:
+        raise ValueError("Failed to load X data from files")
+    if data['y'] is None:
+        raise ValueError("Failed to load y data from files")
+    
+    # Ensure y has the correct dimensions (squeeze if it's shape [N,1])
+    if data['y'] is not None and data['y'].dim() > 1 and data['y'].shape[1] == 1:
+        data['y'] = data['y'].squeeze(1)
+        print(f"Squeezed y data to shape: {data['y'].shape}")
+    
+    print(f"Successfully loaded dataset - X shape: {data['X'].shape}, y shape: {data['y'].shape}")
+    return data
+
+def generate_all_combinations(config):
+    """Generate all parameter combinations."""
+    base_cfg = config["base_config"]
+    sweeps = config["sweeps"]
+    
+    # Get normalization and standardization flags from base config
+    normalize_data = base_cfg.get("normalize_data", False)
+    standardize_data = base_cfg.get("standardize_data", False)
+    # Get frozen layer training flag
+    frozen = base_cfg.get("frozen", False)
+    layer_patience = base_cfg.get("layer_patience", 500)
+    
+    all_combinations = []
+    
+    for sweep_name, sweep_info in sweeps.items():
+        # Handle both directory-based and explicit path-based configs
+        dataset_paths = sweep_info.get("dataset_paths", [])
+        dataset_dirs = sweep_info.get("dataset_dir", [])
+        sweep_params = sweep_info.get("parameters", {})
+        
+        # Handle directory-based approach if specified
+        if dataset_dirs:
+            expanded_paths = []
+            for base_dir in dataset_dirs:
+                print(f"Scanning directory: {base_dir}")
+                try:
+                    # Get all subdirectories that might contain datasets
+                    subdirs = [os.path.join(base_dir, d) for d in os.listdir(base_dir) 
+                              if os.path.isdir(os.path.join(base_dir, d))]
+                    print(f"Found {len(subdirs)} potential dataset directories")
+                    expanded_paths.extend(subdirs)
+                except Exception as e:
+                    print(f"Error scanning directory {base_dir}: {str(e)}")
+            
+            # Add discovered paths to dataset_paths
+            dataset_paths.extend(expanded_paths)
+        
+        dataset_infos = []
+        for ds_path in dataset_paths:
+            ds_info = load_dataset_info(ds_path)
+            if ds_info:
+                dataset_infos.append(ds_info)
+        
+        print(f"Loaded {len(dataset_infos)} valid NN datasets for sweep {sweep_name}")
+        
+        for ds_info in dataset_infos:
+            ds_params = ds_info['params']
+            input_dim = ds_params.get('input_dim')
+            if not input_dim:
+                # Try to extract from directory name
+                input_dim_match = None
+                for part in ds_info['name'].split('_'):
+                    if part.startswith('d') and part[1:].isdigit():
+                        input_dim = int(part[1:])
+                        break
+                if not input_dim:
+                    print(f"Warning: Could not determine input_dim for {ds_info['directory']}, skipping")
+                    continue
+            
+            # Pass architecture and initialization variance to the combinations
+            architecture = ds_params.get('architecture', [])
+            init_variance = ds_params.get('init_variance', 0.1)
+            
+            for n_train in sweep_params.get("n_train", [1024]):
+                for lr in sweep_params.get("learning_rates", [0.001]):
+                    for hidden_size in sweep_params.get("hidden_sizes", [256]):
+                        for depth in sweep_params.get("depths", [1]):
+                            for mode in sweep_params.get("modes", ["standard"]):
+                                for alignment in sweep_params.get("alignment", [False]):
+                                    for exp_num in range(1, base_cfg.get("num_experiments", 1) + 1):
+                                        combo = {
+                                            'dataset_files': ds_info['files'],
+                                            'ds_directory': ds_info['directory'],
+                                            'ds_name': ds_info['name'],
+                                            'hidden_size': hidden_size,
+                                            'depth': depth,
+                                            'input_dim': input_dim,
+                                            'n_train': n_train,
+                                            'lr': lr,
+                                            'mode': mode,
+                                            'experiment_num': exp_num,
+                                            'base_width': sweep_params.get('base_width', 10),
+                                            'alignment': alignment,
+                                            'sweep_name': sweep_name,
+                                            'architecture': architecture,
+                                            'init_variance': init_variance,
+                                            'size_mb': ds_info.get('size_mb', 0),
+                                            'distribution_type': 'gaussian',
+                                            'normalize_data': normalize_data,
+                                            'standardize_data': standardize_data,
+                                            'frozen': frozen,
+                                            'layer_patience': layer_patience
+                                        }
+                                        all_combinations.append(combo)
+    
+    return all_combinations
+
+
+def worker_process(gpu_id, num_gpus, all_combinations, config, full_results_dir, timestamp, checkpoint_log_path, completed_configs):
+    """Process worker that trains models on a specific GPU"""
+    try:
+        start_time = time.time()
+        torch.cuda.set_device(gpu_id)
+        device = torch.device(f'cuda:{gpu_id}')
+        
+        # Enable optimizations
+        torch.backends.cuda.matmul.allow_tf32 = True
+        if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+            torch.backends.cuda.enable_mem_efficient_sdp = True
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision('high')
+        torch.cuda.empty_cache()
+        
+        print(f"[GPU {gpu_id}] Worker started on device {device}")
+        
+        # Filter combinations for this GPU using modulo assignment
+        worker_combinations = [combo for i, combo in enumerate(all_combinations) if i % num_gpus == gpu_id]
+        print(f"[GPU {gpu_id}] Assigned {len(worker_combinations)} configurations")
+        
+        # Remove already completed configurations
+        worker_combinations = [combo for combo in worker_combinations 
+                              if generate_unique_id(combo) not in completed_configs]
+        
+        if not worker_combinations:
+            print(f"[GPU {gpu_id}] All configurations already completed")
+            return
+            
+        print(f"[GPU {gpu_id}] Processing {len(worker_combinations)} incomplete configurations")
+        
+        # Group by dataset directory
+        by_dataset = {}
+        for combo in worker_combinations:
+            ds_dir = combo['ds_directory']
+            if ds_dir not in by_dataset:
+                by_dataset[ds_dir] = []
+            by_dataset[ds_dir].append(combo)
+        
+        # Process each dataset group
+        completed_count = 0
+        total_to_process = len(worker_combinations)
+        
+        for ds_dir, dataset_combos in by_dataset.items():
+            # Skip empty dataset groups
+            if not dataset_combos:
+                continue
+                
+            print(f"[GPU {gpu_id}] Loading dataset from: {ds_dir}")
+            
+            try:
+                # Load dataset once for all experiments
+                dataset_files = dataset_combos[0]['dataset_files']
+                data = load_dataset_directly(dataset_files, device)
+                
+                X_full = data['X']
+                y_full = data['y']
+                
+                print(f"[GPU {gpu_id}] Loaded dataset - X shape: {X_full.shape}, y shape: {y_full.shape}")
+                
+                # Get normalization and standardization flags from first combo
+                should_normalize_data = dataset_combos[0].get('normalize_data', False)
+                should_standardize_data = dataset_combos[0].get('standardize_data', False)
+                
+                # Apply transformations to the FULL dataset before splitting
+                transform_params = {}
+                
+                # Apply normalization if requested (to range [-1, 1])
+                if should_normalize_data:
+                    print(f"[GPU {gpu_id}] Normalizing data to range [-1, 1]")
+                    X_full, norm_params_X = normalize_data(X_full, dim=1, range_min=-1, range_max=1)
+                    transform_params['normalize_X'] = norm_params_X
+                    
+                    # Normalize y data
+                    if y_full.dim() > 1 and y_full.shape[1] > 1:
+                        y_full, norm_params_y = normalize_data(y_full, dim=1, range_min=-1, range_max=1)
+                    else:
+                        y_full, norm_params_y = normalize_data(y_full, dim=0, range_min=-1, range_max=1)
+                    transform_params['normalize_y'] = norm_params_y
+                    
+                    print(f"[GPU {gpu_id}] Data normalized. New ranges - X: [{X_full.min().item():.4f}, {X_full.max().item():.4f}], y: [{y_full.min().item():.4f}, {y_full.max().item():.4f}]")
+                
+                # Apply standardization if requested
+                if should_standardize_data:
+                    print(f"[GPU {gpu_id}] Standardizing data to mean=0, std=1")
+                    X_full, std_params_X = standardize_data(X_full, dim=1)
+                    transform_params['standardize_X'] = std_params_X
+                    
+                    if y_full.dim() > 1 and y_full.shape[1] > 1:
+                        y_full, std_params_y = standardize_data(y_full, dim=1)
+                    else:
+                        y_full, std_params_y = standardize_data(y_full, dim=0)
+                    transform_params['standardize_y'] = std_params_y
+                    
+                    print(f"[GPU {gpu_id}] Data standardized. New stats - X: mean={X_full.mean().item():.4f}, std={X_full.std().item():.4f}, y: mean={y_full.mean().item():.4f}, std={y_full.std().item():.4f}")
+                
+                # Group experiments by size for optimal batching
+                tiny_exps = [c for c in dataset_combos if c['n_train'] < TINY_THRESHOLD]
+                small_exps = [c for c in dataset_combos if TINY_THRESHOLD <= c['n_train'] < SMALL_THRESHOLD]
+                medium_exps = [c for c in dataset_combos if SMALL_THRESHOLD <= c['n_train'] < MEDIUM_THRESHOLD]
+                large_exps = [c for c in dataset_combos if MEDIUM_THRESHOLD <= c['n_train'] < LARGE_THRESHOLD]
+                huge_exps = [c for c in dataset_combos if c['n_train'] >= LARGE_THRESHOLD]
+                
+                # Process tiny experiments in parallel batches
+                if tiny_exps:
+                    for i in range(0, len(tiny_exps), MAX_PARALLEL_TINY):
+                        batch = tiny_exps[i:i+MAX_PARALLEL_TINY]
+                        print(f"[GPU {gpu_id}] Processing batch of {len(batch)}/{len(tiny_exps)} tiny experiments")
+                        n_completed = layerwise_parallel_training(
+                            batch, device, X_full, y_full, config["base_config"],
+                            BATCH_SIZE_TINY, 10, config["base_config"]["epochs"],
+                            full_results_dir, timestamp, gpu_id, checkpoint_log_path, completed_configs, BATCH_POWER,
+                            transform_params
+                        )
+                        completed_count += n_completed
+                        print(f"[GPU {gpu_id}] Progress: {completed_count}/{total_to_process} ({completed_count/total_to_process:.1%})")
+                
+                # Process small experiments in parallel batches
+                if small_exps:
+                    for i in range(0, len(small_exps), MAX_PARALLEL_SMALL):
+                        batch = small_exps[i:i+MAX_PARALLEL_SMALL]
+                        print(f"[GPU {gpu_id}] Processing batch of {len(batch)}/{len(small_exps)} small experiments")
+                        n_completed = layerwise_parallel_training(
+                            batch, device, X_full, y_full, config["base_config"],
+                            BATCH_SIZE_SMALL, 20, config["base_config"]["epochs"],
+                            full_results_dir, timestamp, gpu_id, checkpoint_log_path, completed_configs, BATCH_POWER,
+                            transform_params
+                        )
+                        completed_count += n_completed
+                        print(f"[GPU {gpu_id}] Progress: {completed_count}/{total_to_process} ({completed_count/total_to_process:.1%})")
+                
+                # Process medium experiments in smaller parallel batches
+                if medium_exps:
+                    for i in range(0, len(medium_exps), MAX_PARALLEL_MEDIUM):
+                        batch = medium_exps[i:i+MAX_PARALLEL_MEDIUM]
+                        print(f"[GPU {gpu_id}] Processing batch of {len(batch)}/{len(medium_exps)} medium experiments")
+                        n_completed = layerwise_parallel_training(
+                            batch, device, X_full, y_full, config["base_config"],
+                            BATCH_SIZE_MEDIUM, 30, config["base_config"]["epochs"],
+                            full_results_dir, timestamp, gpu_id, checkpoint_log_path, completed_configs, BATCH_POWER,
+                            transform_params
+                        )
+                        completed_count += n_completed
+                        print(f"[GPU {gpu_id}] Progress: {completed_count}/{total_to_process} ({completed_count/total_to_process:.1%})")
+                
+                # Process large experiments with less parallelism
+                if large_exps:
+                    for i in range(0, len(large_exps), MAX_PARALLEL_LARGE):
+                        batch = large_exps[i:i+MAX_PARALLEL_LARGE]
+                        print(f"[GPU {gpu_id}] Processing batch of {len(batch)}/{len(large_exps)} large experiments")
+                        n_completed = layerwise_parallel_training(
+                            batch, device, X_full, y_full, config["base_config"],
+                            BATCH_SIZE_LARGE, 40, config["base_config"]["epochs"], 
+                            full_results_dir, timestamp, gpu_id, checkpoint_log_path, completed_configs, BATCH_POWER,
+                            transform_params
+                        )
+                        completed_count += n_completed
+                        print(f"[GPU {gpu_id}] Progress: {completed_count}/{total_to_process} ({completed_count/total_to_process:.1%})")
+                
+                # Process huge experiments individually
+                if huge_exps:
+                    for i in range(0, len(huge_exps), MAX_PARALLEL_HUGE):
+                        batch = huge_exps[i:i+MAX_PARALLEL_HUGE]
+                        print(f"[GPU {gpu_id}] Processing batch of {len(batch)}/{len(huge_exps)} huge experiments")
+                        n_completed = layerwise_parallel_training(
+                            batch, device, X_full, y_full, config["base_config"],
+                            BATCH_SIZE_HUGE, 50, config["base_config"]["epochs"], 
+                            full_results_dir, timestamp, gpu_id, checkpoint_log_path, completed_configs, BATCH_POWER,
+                            transform_params
+                        )
+                        completed_count += n_completed
+                        print(f"[GPU {gpu_id}] Progress: {completed_count}/{total_to_process} ({completed_count/total_to_process:.1%})")
+                
+            except Exception as e:
+                print(f"[GPU {gpu_id}] ERROR processing dataset {ds_dir}: {str(e)}")
+                traceback.print_exc()
+                continue
+            
+            # Clear memory after processing a dataset
+            del X_full, y_full, data
+            torch.cuda.empty_cache()
+        
+        elapsed_time = time.time() - start_time
+        print(f"[GPU {gpu_id}] Completed all experiments in {elapsed_time:.2f} seconds")
+        print(f"[GPU {gpu_id}] Average time per experiment: {elapsed_time/max(1, completed_count):.2f} seconds")
+        
+    except Exception as e:
+        print(f"[GPU {gpu_id}] Fatal error: {str(e)}")
+        traceback.print_exc()
+
+
+def convert_tensors_for_json(obj):
+    """Convert PyTorch tensors to Python native types for JSON serialization."""
+    if isinstance(obj, torch.Tensor):
+        if obj.numel() == 1:
+            return obj.item()
+        else:
+            return obj.detach().cpu().numpy().tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_tensors_for_json(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_tensors_for_json(item) for item in obj]
+    else:
+        return obj
+
+
+def layerwise_parallel_training(config_batch, device, X_full, y_full, base_config, 
+                          initial_batch_size, eval_interval, max_epochs,
+                          full_results_dir, timestamp, gpu_id, checkpoint_log_path, completed_configs, BATCH_POWER,
+                          transform_params=None):
+    """Train models using layer-wise training approach according to the frozen parameter."""
+    # Define GNS measurement schedule - early and logarithmically spaced points
+    GNS_EPOCHS = [5]  # Always measure at epoch 5
+    
+    if max_epochs > 10:
+        for i in range(1, 10):
+            epoch = min(max_epochs - 1, int(5 + (max_epochs - 5) * (i / 9)**2))
+            if epoch not in GNS_EPOCHS:
+                GNS_EPOCHS.append(epoch)
+        GNS_EPOCHS.sort()
+    
+    LATER_ADJUSTMENTS_STRENGTH = 0.8  # Factor for later adjustments
+    
+    print(f"[GPU {gpu_id}] GNS will be measured at epochs: {GNS_EPOCHS}")
+    
+    # Get test data
+    n_test = base_config['n_test']
+    fixed_seed = abs(hash(str(config_batch[0]['ds_directory']))) % (2**32)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(fixed_seed)
+    indices = torch.randperm(len(X_full), device=device, generator=generator)
+    test_indices = indices[:n_test]
+    train_master_indices = indices[n_test:]
+    X_test = X_full[test_indices]
+    y_test = y_full[test_indices]
+    
+    # Track total completed experiments
+    completed_count = 0
+    
+    # Process each model in the batch
+    for config_item in config_batch:
+        unique_id = generate_unique_id(config_item)
+        
+        if unique_id in completed_configs:
+            continue
+            
+        # Sample training data
+        n_train = config_item['n_train']
+        sample_seed = hash(f"sample_{n_train}_{config_item['ds_name']}_{config_item['experiment_num']}")
+        torch.manual_seed(sample_seed)
+        
+        if n_train < len(train_master_indices):
+            train_indices = train_master_indices[torch.randperm(len(train_master_indices), device=device)[:n_train]]
+            X_train = X_full[train_indices]
+            y_train = y_full[train_indices]
+        else:
+            X_train = X_full[train_master_indices]
+            y_train = y_full[train_master_indices]
+        
+        # Create evaluation subset (limited to EVAL_SUBSET_SIZE points)
+        eval_seed = hash(f"eval_{n_train}_{config_item['ds_name']}_{config_item['experiment_num']}")
+        generator = torch.Generator(device=device)
+        generator.manual_seed(eval_seed)
+        
+        if len(X_train) <= EVAL_SUBSET_SIZE:
+            X_eval = X_train
+            y_eval = y_train
+        else:
+            eval_indices = torch.randperm(len(X_train), device=device, generator=generator)[:EVAL_SUBSET_SIZE]
+            X_eval = X_train[eval_indices]
+            y_eval = y_train[eval_indices]
+        
+        # Save dataset if requested
+        if base_config.get('save_dataset', False):
+            dataset_dir = os.path.join(full_results_dir, "datasets")
+            os.makedirs(dataset_dir, exist_ok=True)
+            dataset_path = os.path.join(dataset_dir, f"dataset_{unique_id}.pt")
+            dataset = {
+                'X': X_train.cpu(), 
+                'y': y_train.cpu(), 
+                'X_test': X_test.cpu(), 
+                'y_test': y_test.cpu(),
+                'transform_params': transform_params
+            }
+            save_dataset(dataset, dataset_path)
+        
+        # Initialize model
+        model_seed = hash(f"model_{config_item['ds_name']}_{timestamp}_{gpu_id}_{config_item['experiment_num']}")
+        torch.manual_seed(model_seed)
+        
+        input_dim = config_item['input_dim']
+        hidden_size = config_item['hidden_size']
+        depth = config_item['depth']
+        
+        model = DeepNN(
+            input_dim, 
+            hidden_size, 
+            depth, 
+            mode=config_item['mode'], 
+            alignment=config_item['alignment'],
+            base_width=config_item.get('base_width', 10)
+        ).to(device)
+        
+        # Get layer-wise training parameters
+        frozen_mode = config_item.get('frozen', False)
+        layer_patience = config_item.get('layer_patience', 500)
+        
+        print(f"[GPU {gpu_id}] Starting layer-wise training for experiment {unique_id}")
+        print(f"[GPU {gpu_id}] Training mode: {'Frozen layers' if frozen_mode else 'Progressive unfreezing'}")
+        print(f"[GPU {gpu_id}] Layer patience: {layer_patience} epochs")
+        
+        # Layer-wise training results tracking
+        layerwise_results = {
+            'layers_trained': [],
+            'layer_epochs': [],
+            'layer_train_errors': [],
+            'layer_test_errors': []
+        }
+        
+        # Initialize mixed-precision scaler
+        amp_dtype = torch.bfloat16 if device.type == 'cuda' else torch.float32
+        scaler = torch.amp.GradScaler(enabled=device.type == 'cuda')
+        
+        # Prepare the model for layer-wise training
+        num_linear_layers = sum(1 for layer in model.layers if isinstance(layer, nn.Linear))
+        
+        # Full model error tracking
+        train_errors = []
+        test_errors = []
+        epoch_numbers = []
+        
+        # Initial model evaluation
+        with torch.no_grad():
+            with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=device.type == 'cuda'):
+                model.eval()
+                eval_output = model(X_eval)
+                test_output = model(X_test)
+                
+                initial_train_error = torch.mean((eval_output - y_eval) ** 2).item()
+                initial_test_error = torch.mean((test_output - y_test) ** 2).item()
+                
+                train_errors.append(initial_train_error)
+                test_errors.append(initial_test_error)
+                epoch_numbers.append(0)
+        
+        # Start with initial batch size based on dataset size
+        if n_train < TINY_THRESHOLD:
+            current_batch_size = BATCH_SIZE_TINY
+        elif n_train < SMALL_THRESHOLD:
+            current_batch_size = BATCH_SIZE_SMALL
+        elif n_train < MEDIUM_THRESHOLD:
+            current_batch_size = BATCH_SIZE_MEDIUM
+        elif n_train < LARGE_THRESHOLD:
+            current_batch_size = BATCH_SIZE_LARGE
+        else:
+            current_batch_size = BATCH_SIZE_HUGE
+        
+        # Layer-wise training
+        linear_layer_idx = 0  # Track linear layer index
+        total_active_layers = 0
+        total_epochs = 0
+        
+        # Track the active layers (will grow for progressive_unfreeze or shift for frozen approach)
+        active_linear_layers = []
+        
+        # Loop through all linear layers (or pairs in frozen mode)
+        while linear_layer_idx < num_linear_layers:
+            # Determine which layers to train in this phase
+            if frozen_mode:
+                # In frozen mode, we only train one layer at a time
+                active_linear_layers = [linear_layer_idx]
+                print(f"[GPU {gpu_id}] Training linear layer {linear_layer_idx+1} of {num_linear_layers}")
+            else:
+                # In progressive unfreezing mode, we add one more layer to train
+                active_linear_layers.append(linear_layer_idx)
+                layers_desc = ", ".join([f"{i+1}" for i in active_linear_layers])
+                print(f"[GPU {gpu_id}] Training linear layers {layers_desc} of {num_linear_layers}")
+            
+            # Calculate how many actual model layers we're training (linear + activations)
+            active_params = []
+            
+            # Freeze/unfreeze layers based on active_linear_layers
+            linear_count = 0
+            for i, layer in enumerate(model.layers):
+                if isinstance(layer, nn.Linear):
+                    # Unfreeze this layer if it's in our active set
+                    if linear_count in active_linear_layers:
+                        for param in layer.parameters():
+                            param.requires_grad = True
+                            active_params.append(param)
+                    else:
+                        for param in layer.parameters():
+                            param.requires_grad = False
+                    linear_count += 1
+            
+            # Setup optimizer for current active layers
+            weight_decay = float(base_config["weight_decay"])
+            base_lr = config_item["lr"]
+            
+            # Scale with batch size
+            batch_size_ratio = current_batch_size / ORIG_BATCH_SIZE
+            scaled_lr = base_lr * (batch_size_ratio ** BATCH_POWER)
+            
+            # Store the original learning rate for warmup
+            original_lr = scaled_lr
+            
+            # Start with a very small learning rate for extended warmup
+            initial_warmup_lr = scaled_lr * 0.01  # Start at 1% of target LR
+            
+            # Create optimizer for active parameters only
+            optimizer = optim.Adam(active_params, lr=initial_warmup_lr, weight_decay=weight_decay, eps=1e-9)
+            
+            # Use CosineAnnealingLR for smooth learning rate decay
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=max_epochs,
+                eta_min=scaled_lr * 0.3
+            )
+            
+            # Error history tracking for this layer
+            layer_train_errors = []
+            layer_test_errors = []
+            layer_epochs = []
+            
+            # Track initial errors
+            with torch.no_grad():
+                with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=device.type == 'cuda'):
+                    model.eval()
+                    eval_output = model(X_eval)
+                    test_output = model(X_test)
+                    
+                    layer_train_error = torch.mean((eval_output - y_eval) ** 2).item()
+                    layer_test_error = torch.mean((test_output - y_test) ** 2).item()
+                    
+                    layer_train_errors.append(layer_train_error)
+                    layer_test_errors.append(layer_test_error)
+                    layer_epochs.append(0)
+            
+            # Early stopping parameters for this layer training
+            early_stop_threshold = 1e-12
+            best_error = float('inf')
+            patience_counter = 0
+            early_stopped = False
+            
+            # Train this layer (or set of layers) for up to max_epochs
+            for epoch in range(max_epochs):
+                total_epochs += 1  # Track total epochs across all layers
+                
+                # Apply gradual warmup if in warmup phase
+                warmup_epochs = max(5, int(max_epochs * 0.3))
+                if epoch < warmup_epochs:
+                    warmup_progress = epoch / warmup_epochs
+                    warmup_factor = warmup_progress ** 3  # Cubic curve gives slower initial warmup
+                    current_lr = original_lr * warmup_factor
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = current_lr
+                    
+                    log_interval = min(int(warmup_epochs / 10), 100) 
+                    if epoch % log_interval == 0 or epoch == warmup_epochs - 1:
+                        print(f"[GPU {gpu_id}] Layer {linear_layer_idx+1}: Warmup progress {warmup_progress:.2f}, LR = {current_lr:.8f}")
+                
+                # Train for one epoch
+                model.train()
+                
+                # Sample random batch
+                if len(X_train) <= current_batch_size:
+                    batch_X, batch_y = X_train, y_train
+                else:
+                    batch_indices = torch.randperm(len(X_train), device=device)[:current_batch_size]
+                    batch_X = X_train[batch_indices]
+                    batch_y = y_train[batch_indices]
+                
+                # One training step
+                optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=device.type == 'cuda'):
+                    output = model(batch_X)
+                    loss = torch.mean((output - batch_y) ** 2)
+                
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                
+                # Step the scheduler if after warmup
+                if epoch >= warmup_epochs:
+                    # For first epoch after warmup, reset the scheduler with proper LR
+                    if epoch == warmup_epochs:
+                        current_lr = optimizer.param_groups[0]['lr']
+                        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                            optimizer,
+                            T_max=max_epochs - warmup_epochs,
+                            eta_min=current_lr * 0.3
+                        )
+                        print(f"[GPU {gpu_id}] Layer {linear_layer_idx+1}: Warmup complete, starting scheduler at LR={current_lr:.8f}")
+                    
+                    # Step the scheduler
+                    scheduler.step()
+                
+                # Evaluate periodically
+                if (epoch + 1) % eval_interval == 0 or epoch == max_epochs - 1:
+                    with torch.no_grad():
+                        with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=device.type == 'cuda'):
+                            model.eval()
+                            eval_output = model(X_eval)
+                            test_output = model(X_test)
+                            
+                            layer_train_error = torch.mean((eval_output - y_eval) ** 2).item()
+                            layer_test_error = torch.mean((test_output - y_test) ** 2).item()
+                            
+                            layer_train_errors.append(layer_train_error)
+                            layer_test_errors.append(layer_test_error)
+                            layer_epochs.append(epoch + 1)
+                            
+                            # Also track in overall model error history
+                            train_errors.append(layer_train_error)
+                            test_errors.append(layer_test_error)
+                            epoch_numbers.append(total_epochs)
+                            
+                            # Early stopping logic based on train error improvement
+                            if layer_train_error < best_error:
+                                best_error = layer_train_error
+                                patience_counter = 0
+                            else:
+                                patience_counter += 1
+                            
+                            # Report progress
+                            if epoch > 0:
+                                print(f"[GPU {gpu_id}] Layer {linear_layer_idx+1} Epoch {epoch+1}: "
+                                      f"Train error = {layer_train_error:.6e}, Test error = {layer_test_error:.6e}, "
+                                      f"Patience = {patience_counter}/{layer_patience}")
+                            
+                            # Check early stopping conditions
+                            if layer_train_error < early_stop_threshold:
+                                print(f"[GPU {gpu_id}] Layer {linear_layer_idx+1} converged to very low error: {layer_train_error:.8e}")
+                                early_stopped = True
+                                break
+                                
+                            if patience_counter >= layer_patience:
+                                print(f"[GPU {gpu_id}] Layer {linear_layer_idx+1} stopped early due to no improvement for {layer_patience} epochs")
+                                early_stopped = True
+                                break
+            
+            # Record results for this layer
+            layerwise_results['layers_trained'].append(active_linear_layers.copy())
+            layerwise_results['layer_epochs'].append(layer_epochs)
+            layerwise_results['layer_train_errors'].append(layer_train_errors)
+            layerwise_results['layer_test_errors'].append(layer_test_errors)
+            
+            # Move to next layer if we haven't finished
+            linear_layer_idx += 1
+        
+        # All layers have been trained, now do fine-tuning
+        fine_tuning_epochs = base_config.get("fine_tuning_epochs", 500)
+        
+        if fine_tuning_epochs > 0:
+            print(f"[GPU {gpu_id}] Starting fine-tuning phase for {fine_tuning_epochs} epochs")
+            
+            # Unfreeze all layers for fine-tuning
+            for param in model.parameters():
+                param.requires_grad = True
+            
+            # Switch to full precision for fine-tuning
+            model_dtype = next(model.parameters()).dtype
+            model.to(dtype=torch.float32)
+            X_train_fp32 = X_train.to(dtype=torch.float32)
+            y_train_fp32 = y_train.to(dtype=torch.float32)
+            X_eval_fp32 = X_eval.to(dtype=torch.float32)
+            y_eval_fp32 = y_eval.to(dtype=torch.float32)
+            X_test_fp32 = X_test.to(dtype=torch.float32)
+            y_test_fp32 = y_test.to(dtype=torch.float32)
+            
+            # Set up fine-tuning with warm-up
+            current_lr = optimizer.param_groups[0]['lr']
+            initial_ft_lr = current_lr * 0.01
+            
+            # Create new optimizer for all parameters
+            optimizer = optim.Adam(model.parameters(), lr=initial_ft_lr, weight_decay=weight_decay, eps=1e-9)
+            
+            # Create scheduler for after warmup
+            ft_warmup_epochs = max(5, int(fine_tuning_epochs * 0.2))
+            
+            # Fine-tuning loop
+            for ft_epoch in range(fine_tuning_epochs):
+                total_epochs += 1  # Continue counting total epochs
+                
+                # Apply warmup if in warmup phase
+                if ft_epoch < ft_warmup_epochs:
+                    warmup_progress = ft_epoch / ft_warmup_epochs
+                    warmup_factor = warmup_progress ** 3
+                    new_lr = current_lr * warmup_factor
+                    
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = new_lr
+                    
+                    if ft_epoch % 10 == 0 or ft_epoch == ft_warmup_epochs - 1:
+                        print(f"[GPU {gpu_id}] Fine-tuning warmup {warmup_progress:.2f}, LR = {new_lr:.8f}")
+                        
+                elif ft_epoch == ft_warmup_epochs:
+                    # Create scheduler for the rest of fine-tuning
+                    ft_current_lr = optimizer.param_groups[0]['lr']
+                    ft_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                        optimizer,
+                        T_max=fine_tuning_epochs - ft_warmup_epochs,
+                        eta_min=ft_current_lr / 100
+                    )
+                    print(f"[GPU {gpu_id}] Fine-tuning warmup complete, starting scheduler at LR={ft_current_lr:.8f}")
+                elif ft_epoch > ft_warmup_epochs:
+                    # Step the scheduler after warmup
+                    ft_scheduler.step()
+                
+                # Train for one epoch
+                model.train()
+                
+                # For small datasets, use full batch for perfect memorization
+                if len(X_train_fp32) <= 100:
+                    batch_X, batch_y = X_train_fp32, y_train_fp32
+                else:
+                    batch_indices = torch.randperm(len(X_train_fp32), device=device)[:current_batch_size]
+                    batch_X = X_train_fp32[batch_indices]
+                    batch_y = y_train_fp32[batch_indices]
+                
+                # One training step with full precision
+                optimizer.zero_grad(set_to_none=True)
+                output = model(batch_X)
+                loss = torch.mean((output - batch_y) ** 2)
+                loss.backward()
+                optimizer.step()
+                
+                # Evaluate at end or periodically
+                if ft_epoch == fine_tuning_epochs - 1 or (ft_epoch > 0 and ft_epoch % (fine_tuning_epochs // 10) == 0):
+                    with torch.no_grad():
+                        model.eval()
+                        eval_output = model(X_eval_fp32)
+                        test_output = model(X_test_fp32)
+                        
+                        ft_train_error = torch.mean((eval_output - y_eval_fp32) ** 2).item()
+                        ft_test_error = torch.mean((test_output - y_test_fp32) ** 2).item()
+                        
+                        # Record in overall history
+                        train_errors.append(ft_train_error)
+                        test_errors.append(ft_test_error)
+                        epoch_numbers.append(total_epochs)
+                        
+                        print(f"[GPU {gpu_id}] Fine-tuning epoch {ft_epoch+1}/{fine_tuning_epochs}: "
+                              f"Train error = {ft_train_error:.6e}, Test error = {ft_test_error:.6e}")
+            
+            # Restore original dtype
+            model.to(dtype=model_dtype)
+        
+        # Final evaluation on full dataset
+        with torch.no_grad():
+            model.eval()
+            if fine_tuning_epochs > 0:
+                # Use FP32 for final evaluation
+                train_output = model(X_train.to(dtype=torch.float32))
+                test_output = model(X_test.to(dtype=torch.float32))
+                
+                final_train_error = torch.mean((train_output - y_train.to(dtype=torch.float32)) ** 2).item()
+                final_test_error = torch.mean((test_output - y_test.to(dtype=torch.float32)) ** 2).item()
+            else:
+                # Use model's current precision
+                with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=device.type == 'cuda'):
+                    train_output = model(X_train)
+                    test_output = model(X_test)
+                    
+                    final_train_error = torch.mean((train_output - y_train) ** 2).item()
+                    final_test_error = torch.mean((test_output - y_test) ** 2).item()
+        
+        # Format architecture as string
+        arch = config_item.get('architecture', [])
+        arch_str = 'x'.join([str(dim) for dim in arch]) if arch else ""
+        
+        # Build result dictionary
+        result = {
+            'dataset_name': config_item['ds_name'],
+            'dataset_directory': config_item['ds_directory'],
+            'hidden_size': config_item['hidden_size'],
+            'depth': config_item['depth'],
+            'input_dim': config_item['input_dim'],
+            'base_width': config_item.get('base_width', 10),
+            'n_train': config_item['n_train'],
+            'learning_rate': config_item['lr'],
+            'mode': config_item['mode'],
+            'alignment': config_item['alignment'],
+            'frozen': config_item.get('frozen', False),
+            'distribution_type': 'gaussian',
+            'architecture': arch,
+            'architecture_str': arch_str,
+            'init_variance': config_item.get('init_variance', 0.1),
+            'normalize_data': config_item.get('normalize_data', False),
+            'standardize_data': config_item.get('standardize_data', False),
+            'test_error': final_test_error,
+            'initial_train_error': train_errors[0],
+            'final_train_error': final_train_error,
+            'error_history': {
+                'train_errors': train_errors,
+                'test_errors': test_errors,
+                'epochs': epoch_numbers,
+                'total_epochs': total_epochs,
+                'layerwise_results': layerwise_results,
+                'layer_patience': layer_patience,
+                'early_stop_threshold': early_stop_threshold,
+                'final_batch_size': current_batch_size,
+                'used_fp32_fine_tuning': fine_tuning_epochs > 0,
+                'fine_tuning_epochs': fine_tuning_epochs
+            },
+            'worker_gpu': gpu_id,
+            'model_seed': model_seed,
+            'experiment_num': config_item['experiment_num'],
+            'sweep_name': config_item['sweep_name'],
+            'layerwise_trained': True
+        }
+        
+        # Save results
+        results_file_path = os.path.join(full_results_dir, f"results_{timestamp}_gpu{gpu_id}.jsonl")
+        with open(results_file_path, "a") as f:
+            # Convert any tensors to JSON-serializable types
+            json_safe_result = convert_tensors_for_json(result)
+            f.write(json.dumps(json_safe_result) + "\n")
+            f.flush()
+        
+        # Save final model if requested
+        if base_config.get('save_model', False):
+            final_model_dir = os.path.join(full_results_dir, "final_models")
+            os.makedirs(final_model_dir, exist_ok=True)
+            final_model_path = os.path.join(final_model_dir, f"final_model_{unique_id}.pt")
+            save_model(model, final_model_path)
+        
+        # Mark as completed
+        with open(checkpoint_log_path, "a") as cp_f:
+            cp_f.write(unique_id + "\n")
+        completed_configs.add(unique_id)
+        completed_count += 1
+        
+        # Clean up to save memory before next experiment
+        del model, optimizer
+        if 'ft_scheduler' in locals():
+            del ft_scheduler
+        torch.cuda.empty_cache()
+    
+    return completed_count
+
+
+def main():
+    try:
+        start_time = time.time()
+        print(f"Starting at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"PyTorch version: {torch.__version__}")
+        print(f"CUDA available: {torch.cuda.is_available()}")
+        print(f"CUDA device count: {torch.cuda.device_count()}")
+        
+        if len(sys.argv) < 2:
+            print("Usage: python main.py <config_file.yaml>")
+            sys.exit(1)
+        
+        config_path = sys.argv[1]
+        print(f"Loading config from: {config_path}")
+        
+        config = load_yaml_config(config_path)
+        
+        # Extract Base Config
+        base_cfg = config["base_config"]
+        base_results_dir = base_cfg["base_results_dir"]
+        restart_checkpoint = base_cfg.get("restart_checkpoint")
+        
+        # Ensure fine_tuning_epochs is set
+        if "fine_tuning_epochs" not in base_cfg:
+            base_cfg["fine_tuning_epochs"] = 3000
+            
+        # Ensure layer_patience is set
+        if "layer_patience" not in base_cfg:
+            base_cfg["layer_patience"] = 500
+            
+        # Ensure frozen is set
+        if "frozen" not in base_cfg:
+            base_cfg["frozen"] = False
+        
+        # Create experiment name
+        sweep_names = list(config["sweeps"].keys())
+        frozen_suffix = "_frozen" if base_cfg.get("frozen", False) else "_progressive"
+        experiment_name = f"{'_'.join(sweep_names)}{frozen_suffix}_exp_{datetime.now().strftime('%Y%m%d')}"
+        
+        # Set up Results Directory
+        full_results_dir = os.path.join(base_results_dir, experiment_name)
+        os.makedirs(full_results_dir, exist_ok=True)
+        
+        # Set up Checkpointing
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        checkpoint_log_path = os.path.join(full_results_dir, f"checkpoint_{timestamp}.txt")
+        
+        # Handle restart logic
+        if restart_checkpoint is not None:
+            checkpoint_log_path = restart_checkpoint
+            with open(checkpoint_log_path, "r") as f:
+                completed_configs = set(line.strip() for line in f if line.strip())
+            timestamp = os.path.basename(restart_checkpoint).replace("checkpoint_", "").replace(".txt", "")
+            print(f"Restarting from checkpoint with {len(completed_configs)} completed configurations")
+        else:
+            if os.path.exists(checkpoint_log_path):
+                with open(checkpoint_log_path, "r") as f:
+                    completed_configs = set(line.strip() for line in f if line.strip())
+                print(f"Using existing checkpoint with {len(completed_configs)} completed configs")
+            else:
+                completed_configs = set()
+                print(f"Starting new run")
+            
+            # Save hyperparameters
+            hyperparams_path = os.path.join(full_results_dir, f"hyperparameters_{timestamp}.yaml")
+            with open(hyperparams_path, "w") as f:
+                yaml.dump(config, f, default_flow_style=False)
+        
+        # Generate all combinations
+        print("Generating parameter combinations...")
+        all_combinations = generate_all_combinations(config)
+        print(f"Generated {len(all_combinations)} combinations")
+        
+        # Filter out completed configurations
+        remaining = [c for c in all_combinations if generate_unique_id(c) not in completed_configs]
+        print(f"Remaining configurations to process: {len(remaining)}/{len(all_combinations)}")
+        
+        if not remaining:
+            print("All configurations already completed!")
+            return
+        
+        # Get number of available GPUs
+        num_gpus = torch.cuda.device_count()
+        if num_gpus == 0:
+            print("No GPUs available. Running on CPU.")
+            num_gpus = 1
+        
+        print(f"Using {num_gpus} GPU(s)")
+        
+        # Set multiprocessing start method
+        try:
+            mp.set_start_method('spawn')
+        except RuntimeError:
+            print("spawn method already set")
+        
+        # Launch one process per GPU
+        mp.spawn(
+            worker_process,
+            args=(num_gpus, all_combinations, config, full_results_dir, timestamp, checkpoint_log_path, completed_configs),
+            nprocs=num_gpus,
+            join=True
+        )
+        
+        total_time = time.time() - start_time
+        print(f"All processes completed in {total_time:.2f} seconds")
+        print(f"Finished at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+    except Exception as e:
+        print(f"Error in main: {str(e)}")
+        traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,49 @@
+base_config:
+  base_results_dir: /home/goring/leap/results/NN_0304_k
+  batch_size: 65536
+  checkpoint_epochs: []
+  epochs: 8000
+  fine_tuning_epochs: 3000
+  n_test: 20000
+  normalize_data: false
+  num_experiments: 1
+  restart_checkpoint: null
+  save_dataset: false
+  save_model: false
+  standardize_data: false
+  weight_decay: 0.0
+sweeps:
+  sweep_full:
+    dataset_dir:
+    - /scratch/goring/NN_data/NN_0304_k
+    parameters:
+      alignment:
+      - true
+      base_width: 512
+      depths:
+      - 4
+      gamma: 1.0
+      hidden_sizes:
+      - 512
+      - 2048
+      learning_rates:
+      - 0.0001
+      - 0.001
+      - 0.01
+      modes:
+      - standard
+      - mup
+      n_train:
+      - 10
+      - 100
+      - 1000
+      - 10000
+      - 30000
+      - 50000
+      - 100000
+      - 500000
+      - 750000
+      - 1000000
+      - 3300000
+      - 7500000
+      - 10000000

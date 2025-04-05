@@ -1,0 +1,36 @@
+# Base configuration that contains common settings
+base_config:
+  base_results_dir: "/home/goring/leap/results/NN_0304"
+  epochs: 8000
+  fine_tuning_epochs: 3000
+  batch_size: 65536
+  checkpoint_epochs: []
+  weight_decay: 0.0
+  n_test: 20000
+  save_model: False
+  save_dataset: False
+  normalize_data: False
+  standardize_data: False  # Enabled standardization
+  num_experiments: 1
+  restart_checkpoint: null
+  frozen: False  # New parameter to control layer-wise training approach
+  layer_patience: 500  # Number of epochs with no improvement before moving to next layer
+
+# Sweeps with their specific dataset directories
+sweeps:
+  # Full sweep with directory path
+  sweep_full:
+    # Just provide the base directory containing model directories
+    dataset_dir:
+      - "/scratch/goring/NN_data/NN_0304"
+        
+    # Parameters to sweep over
+    parameters:
+      n_train: [10, 100, 1000, 10000, 30000, 50000, 100000, 500000, 750000, 1000000, 3300000, 7000000,10000000]
+      learning_rates: [0.00001, 0.0001, 0.001, 0.01] #0.00005, 0.0005, 0.001, 0.00001
+      hidden_sizes: [512, 2048]
+      depths: [4]
+      modes: ["standard", "mup"]
+      alignment: [true]
+      base_width: 256
+      gamma: 1.0
